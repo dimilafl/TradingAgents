@@ -8,9 +8,8 @@ canonical pattern:
    not support structured output (rare; mostly older Ollama models), the
    wrap is skipped and the agent uses free-text generation instead.
 2. At invocation, run the structured call and render the result back to
-   markdown. If the structured call itself fails for any reason
-   (malformed JSON from a weak model, transient provider issue), fall
-   back to a plain ``llm.invoke`` so the pipeline never blocks.
+   markdown. If the structured call fails, raise immediately so errors
+   are visible rather than silently falling back to free text.
 
 Centralising the pattern here keeps the agent factories small and ensures
 all three agents log the same warnings when fallback fires.
@@ -18,6 +17,7 @@ all three agents log the same warnings when fallback fires.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Callable, Optional, TypeVar
 
@@ -35,7 +35,9 @@ def bind_structured(llm: Any, schema: type[T], agent_name: str) -> Optional[Any]
     will use free-text generation for every call instead of one-shot fallback.
     """
     try:
-        return llm.with_structured_output(schema)
+        bound = llm.with_structured_output(schema)
+        bound._structured_schema = schema
+        return bound
     except (NotImplementedError, AttributeError) as exc:
         logger.warning(
             "%s: provider does not support with_structured_output (%s); "
@@ -45,6 +47,18 @@ def bind_structured(llm: Any, schema: type[T], agent_name: str) -> Optional[Any]
         return None
 
 
+def _build_schema_hint(structured_llm: Any) -> str:
+    """Extract JSON schema from the bound Pydantic model and format as a prompt hint."""
+    schema_cls = getattr(structured_llm, "_structured_schema", None)
+    if schema_cls is None or not issubclass(schema_cls, BaseModel):
+        return "\n\nRespond in JSON format."
+    schema_dict = schema_cls.model_json_schema()
+    return (
+        "\n\nRespond in JSON format matching this schema:\n"
+        f"```json\n{json.dumps(schema_dict, indent=2)}\n```"
+    )
+
+
 def invoke_structured_or_freetext(
     structured_llm: Optional[Any],
     plain_llm: Any,
@@ -52,7 +66,7 @@ def invoke_structured_or_freetext(
     render: Callable[[T], str],
     agent_name: str,
 ) -> str:
-    """Run the structured call and render to markdown; fall back to free-text on any failure.
+    """Run the structured call and render to markdown; raise on failure.
 
     ``prompt`` is whatever the underlying LLM accepts (a string for chat
     invocations, a list of message dicts for chat models that take that
@@ -61,13 +75,21 @@ def invoke_structured_or_freetext(
     """
     if structured_llm is not None:
         try:
-            result = structured_llm.invoke(prompt)
+            json_prompt = prompt
+            if isinstance(prompt, str) and "json" not in prompt.lower():
+                json_prompt = prompt + _build_schema_hint(structured_llm)
+            elif isinstance(prompt, list):
+                hint = _build_schema_hint(structured_llm)
+                last = prompt[-1]
+                if isinstance(last, dict) and "content" in last and "json" not in last["content"].lower():
+                    json_prompt = [*prompt[:-1], {**last, "content": last["content"] + hint}]
+            result = structured_llm.invoke(json_prompt)
             return render(result)
         except Exception as exc:
-            logger.warning(
-                "%s: structured-output invocation failed (%s); retrying once as free text",
-                agent_name, exc,
-            )
+            raise RuntimeError(
+                f"{agent_name}: structured-output failed. "
+                f"Error: {exc}"
+            ) from exc
 
     response = plain_llm.invoke(prompt)
     return response.content
